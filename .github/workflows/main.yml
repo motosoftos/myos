@@ -1,27 +1,135 @@
-name: Window 10
+name: WINDOWS LATEST RDP
 
-on: [push, workflow_dispatch]
+on:
+  workflow_dispatch:
+    inputs:
+      increment:
+        type: string
+        description: 'ngrok token'
+        required: false
+        default: ''
 
 jobs:
   build:
-
     runs-on: windows-latest
     timeout-minutes: 9999
 
-
     steps:
-    - name: Download
-      run: Invoke-WebRequest https://bin.ngrok.com/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip -OutFile ngrok.zip
-    - name: Extract
-      run: Expand-Archive ngrok.zip
-    - name: Auth
-      run: .\ngrok\ngrok.exe authtoken $Env:NGROK_AUTH_TOKEN
-      env:
-        NGROK_AUTH_TOKEN: ${{ secrets.NGROK_AUTH_TOKEN }}
-    - name: Enable TS
-      run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server'-name "fDenyTSConnections" -Value 0
-    - run: Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-    - run: Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -name "UserAuthentication" -Value 1
-    - run: Set-LocalUser -Name "runneradmin" -Password (ConvertTo-SecureString -AsPlainText "Meadows@123456" -Force)
-    - name: Create Tunnel
-      run: .\ngrok\ngrok.exe tcp 3389
+      - name: 🔽 Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: 🔽 Download Ngrok
+        run: |
+          Invoke-WebRequest https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-windows-amd64.zip -OutFile ngrok.zip
+
+      - name: 📦 Extract Ngrok
+        run: Expand-Archive ngrok.zip
+
+      - name: 🔐 Set Ngrok Authtoken
+        shell: pwsh
+        run: |
+          $inputToken = '${{ github.event.inputs.increment }}'
+          $envToken = $Env:NGROK_AUTH
+          if ($inputToken) {
+            $token = $inputToken
+          } elseif ($envToken) {
+            $token = $envToken
+          } else {
+            Write-Host "❌ No ngrok token provided! Please set NGROK_AUTH secret or provide it as input."
+            exit 1
+          }
+          Write-Host "Using ngrok token: $($token.Substring(0,[Math]::Min(10,$token.Length)))***"
+          .\ngrok\ngrok.exe config add-authtoken $token
+        env:
+          NGROK_AUTH: ${{ secrets.TAKEN }}
+
+      - name: 🔧 Enable RDP & Configure Firewall
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+          Copy-Item wallpaper.bat D:\a\wallpaper.bat
+
+      - name: 🚀 Start Ngrok + Configure RDP Tunnel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ngrok = Join-Path $PWD "ngrok\ngrok.exe"
+          $stdout = Join-Path $PWD "ngrok.log"
+          $stderr = Join-Path $PWD "ngrok-error.log"
+
+          if (-not (Test-Path $ngrok)) {
+            Write-Host "❌ Ngrok executable not found: $ngrok"
+            exit 1
+          }
+
+          Write-Host "🚀 Starting Ngrok from: $ngrok"
+          # Ngrok v3 no longer needs --region.
+          $proc = Start-Process `
+            -FilePath $ngrok `
+            -ArgumentList @("tcp", "3389") `
+            -WorkingDirectory (Split-Path $ngrok) `
+            -WindowStyle Hidden `
+            -RedirectStandardOutput $stdout `
+            -RedirectStandardError $stderr `
+            -PassThru
+
+          Write-Host "Ngrok PID: $($proc.Id)"
+
+          # Keep all Ngrok-dependent work in this SAME step.
+          # GitHub Actions may clean up background processes at step boundaries.
+          $ready = $false
+          $url = $null
+          for ($i = 1; $i -le 20; $i++) {
+            Start-Sleep -Seconds 2
+
+            if ($proc.HasExited) {
+              Write-Host "❌ Ngrok exited with code: $($proc.ExitCode)"
+              if (Test-Path $stderr) { Get-Content $stderr }
+              if (Test-Path $stdout) { Get-Content $stdout }
+              exit 1
+            }
+
+            try {
+              $tunnels = Invoke-RestMethod -Uri 'http://127.0.0.1:4040/api/tunnels' -ErrorAction Stop
+              if ($tunnels.tunnels -and $tunnels.tunnels.Count -gt 0) {
+                $url = $tunnels.tunnels[0].public_url
+                if ($url) {
+                  $ready = $true
+                  break
+                }
+              }
+            } catch {
+              Write-Host "⏳ Waiting for Ngrok API... ($i/20)"
+            }
+          }
+
+          if (-not $ready) {
+            Write-Host "❌ Ngrok started but no tunnel became available."
+            if (Test-Path $stderr) { Get-Content $stderr }
+            if (Test-Path $stdout) { Get-Content $stdout }
+            exit 1
+          }
+
+          Write-Host "✅ Ngrok process is running (PID: $($proc.Id))"
+          Write-Host "✅ Ngrok Public URL: $url"
+
+          $escapedUrl = $url.Replace('"', '\"')
+          $escapedUser = 'administrator'.Replace('"','\"')
+          $escapedPass = 'OLDUSER#06'.Replace('"','\"')
+          $osVersion = 'Latest'
+
+          Write-Host "⚙️ Running RDP setup..."
+          $cmd = ".\start.bat `"$escapedUrl`" `"$escapedUser`" `"$escapedPass`" `"$osVersion`""
+          cmd.exe /c $cmd
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "❌ start.bat failed with exit code $LASTEXITCODE"
+            exit $LASTEXITCODE
+          }
+
+          Write-Host "🌐 Ngrok API response:"
+          curl.exe -s http://127.0.0.1:4040/api/tunnels
+          Write-Host ""
+
+          Write-Host "🔁 Keeping runner and Ngrok tunnel alive..."
+          & .\loop.bat
